@@ -34,6 +34,7 @@ Current output file:
 - Certificate and domain ownership implications.
 - Observability and troubleshooting expectations.
 - Rollout, validation, and rollback planning.
+- Migration guidance from open source ingress-nginx to OpenShift Routes and sharded Ingress Controllers.
 - Risks, limitations, and decision tradeoffs.
 
 ## Current Design Bias
@@ -56,6 +57,8 @@ Current output file:
 - Are certificates managed by the OpenShift ingress operator, a cluster certificate process, or an external certificate workflow?
 - What observability signals are required to prove traffic is reaching the intended shard?
 - What validation steps are required before moving production routes?
+- Which existing ingress-nginx annotations are in use, and which ones require redesign instead of direct translation?
+- Should migrated applications standardize on OpenShift Routes, or should some Kubernetes Ingress resources remain for compatibility?
 
 ## Decision Log
 
@@ -75,6 +78,8 @@ Follow-up:
 
 - OpenShift 4.18 documentation is the authority for IngressController behavior.
 - Verify ingress sharding behavior against the Red Hat OpenShift 4.18 docs before finalizing the HTML artifact.
+- Use official OpenShift route annotation documentation when translating ingress-nginx behavior.
+- Use ingress-nginx upstream documentation to identify source annotation intent before mapping it to OpenShift.
 - Treat implementation examples as illustrative until tested against an OpenShift 4.18 cluster or verified API schema.
 
 ## HTML Artifact Expectations
@@ -95,6 +100,7 @@ Expected diagrams may include:
 - DNS and wildcard domain relationship to router shards.
 - Operational responsibility model.
 - Rollout sequence from default ingress to shard-specific ingress.
+- Migration flow from ingress-nginx Ingress resources to OpenShift Routes and shard admission.
 
 ## Validation Checklist
 
@@ -105,3 +111,4 @@ Expected diagrams may include:
 - Confirm default ingress behavior when additional shards are introduced.
 - Confirm rollback path for moving routes between shards.
 - Confirm observability and troubleshooting commands.
+- Confirm migrated route behavior against the source ingress-nginx behavior, especially rewrites, redirects, TLS, allow lists, and timeouts.

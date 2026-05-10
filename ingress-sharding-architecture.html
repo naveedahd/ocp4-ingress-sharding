@@ -437,6 +437,7 @@
         <a href="#dns-load-balancing">DNS and Load Balancing</a>
         <a href="#security">Security and Certificates</a>
         <a href="#operations">Operations</a>
+        <a href="#ingress-nginx-migration">ingress-nginx Migration</a>
         <a href="#implementation">Implementation Skeleton</a>
         <a href="#validation">Validation</a>
         <a href="#risks">Risks</a>
@@ -798,6 +799,200 @@
           </ul>
         </section>
 
+        <section id="ingress-nginx-migration">
+          <h2>Migrating from ingress-nginx</h2>
+          <p>
+            Migration from the open source <code>ingress-nginx</code> controller should be treated as an application
+            ingress redesign, not a line-for-line annotation conversion. The OpenShift router is HAProxy based,
+            route admission is controlled by <code>IngressController</code> shards, and many
+            <code>nginx.ingress.kubernetes.io/*</code> annotations are controller-specific behavior.
+          </p>
+
+          <div class="callout">
+            <strong>Migration principle:</strong> preserve the external contract first: hostname, path behavior,
+            TLS posture, source restrictions, and backend service expectations. Then decide whether each migrated
+            endpoint should become an OpenShift <code>Route</code>, stay as a Kubernetes <code>Ingress</code> for
+            compatibility, or move behind an application-owned reverse proxy.
+          </div>
+
+          <figure class="diagram">
+            <svg viewBox="0 0 1100 360" role="img" aria-labelledby="migration-title migration-desc">
+              <title id="migration-title">ingress-nginx to OpenShift route migration flow</title>
+              <desc id="migration-desc">Inventory nginx Ingress resources, classify behavior, create Routes or compatibility Ingress resources, admit them into shards, then cut DNS over.</desc>
+              <defs>
+                <marker id="arrow3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                  <path d="M0,0 L0,6 L9,3 z" fill="#334155"></path>
+                </marker>
+              </defs>
+              <rect x="34" y="78" width="180" height="112" rx="8" fill="#fff" stroke="#94a3b8"></rect>
+              <text x="124" y="112" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Existing Ingress</text>
+              <text x="124" y="138" text-anchor="middle" font-size="13" fill="#5f6368">nginx class</text>
+              <text x="124" y="160" text-anchor="middle" font-size="13" fill="#5f6368">nginx annotations</text>
+
+              <rect x="274" y="78" width="180" height="112" rx="8" fill="#fbfaf6" stroke="#cf765d"></rect>
+              <text x="364" y="112" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Inventory</text>
+              <text x="364" y="138" text-anchor="middle" font-size="13" fill="#5f6368">hosts, paths, TLS</text>
+              <text x="364" y="160" text-anchor="middle" font-size="13" fill="#5f6368">rewrite, redirects</text>
+
+              <rect x="514" y="78" width="180" height="112" rx="8" fill="#eef7f9" stroke="#0b6f85"></rect>
+              <text x="604" y="112" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Translate</text>
+              <text x="604" y="138" text-anchor="middle" font-size="13" fill="#5f6368">Route or Ingress</text>
+              <text x="604" y="160" text-anchor="middle" font-size="13" fill="#5f6368">OpenShift annotations</text>
+
+              <rect x="754" y="78" width="180" height="112" rx="8" fill="#f1f7ec" stroke="#4f7d27"></rect>
+              <text x="844" y="112" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Admit to shard</text>
+              <text x="844" y="138" text-anchor="middle" font-size="13" fill="#5f6368">namespace label</text>
+              <text x="844" y="160" text-anchor="middle" font-size="13" fill="#5f6368">route status check</text>
+
+              <rect x="456" y="244" width="188" height="70" rx="8" fill="#fff6ed" stroke="#b45309"></rect>
+              <text x="550" y="274" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">Cutover</text>
+              <text x="550" y="298" text-anchor="middle" font-size="13" fill="#5f6368">DNS, smoke test, rollback</text>
+
+              <line x1="214" y1="134" x2="270" y2="134" stroke="#334155" stroke-width="2" marker-end="url(#arrow3)"></line>
+              <line x1="454" y1="134" x2="510" y2="134" stroke="#334155" stroke-width="2" marker-end="url(#arrow3)"></line>
+              <line x1="694" y1="134" x2="750" y2="134" stroke="#334155" stroke-width="2" marker-end="url(#arrow3)"></line>
+              <path d="M844 190 C820 246, 704 278, 648 279" fill="none" stroke="#334155" stroke-width="2" marker-end="url(#arrow3)"></path>
+            </svg>
+            <figcaption>
+              Recommended migration flow: inventory behavior first, translate deliberately, then cut traffic to a shard.
+            </figcaption>
+          </figure>
+
+          <h3>Inventory worksheet</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Source item</th>
+                <th>Why it matters</th>
+                <th>Migration target</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>ingressClassName</code> or <code>kubernetes.io/ingress.class</code></td>
+                <td>Identifies which controller currently owns the object.</td>
+                <td>Shard membership through namespace labels, route labels, and host/domain placement.</td>
+              </tr>
+              <tr>
+                <td>Host and path rules</td>
+                <td>Defines the client-visible contract and backend selection.</td>
+                <td><code>Route.spec.host</code>, <code>Route.spec.path</code>, and service target port.</td>
+              </tr>
+              <tr>
+                <td>TLS secret and redirect settings</td>
+                <td>Controls certificate source, termination mode, and HTTP-to-HTTPS behavior.</td>
+                <td>Edge, re-encrypt, or passthrough route TLS with <code>insecureEdgeTerminationPolicy</code> where appropriate.</td>
+              </tr>
+              <tr>
+                <td>Rewrite annotations</td>
+                <td>Can change backend request paths and break apps if missed.</td>
+                <td><code>haproxy.router.openshift.io/rewrite-target</code> when behavior matches; otherwise adjust app or proxy design.</td>
+              </tr>
+              <tr>
+                <td>Allow lists, rate limits, body size, timeouts</td>
+                <td>Often encoded as nginx-specific annotations.</td>
+                <td>OpenShift route annotations, shard-level policy, application settings, or a dedicated edge proxy.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Annotation translation guide</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>ingress-nginx pattern</th>
+                <th>OpenShift migration guidance</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>nginx.ingress.kubernetes.io/rewrite-target</code></td>
+                <td>Map to <code>haproxy.router.openshift.io/rewrite-target</code> only after testing path examples. OpenShift replaces the route path prefix with the rewrite target.</td>
+              </tr>
+              <tr>
+                <td><code>nginx.ingress.kubernetes.io/ssl-redirect</code> or <code>force-ssl-redirect</code></td>
+                <td>Use route TLS termination plus <code>insecureEdgeTerminationPolicy: Redirect</code> for edge or re-encrypt routes.</td>
+              </tr>
+              <tr>
+                <td><code>nginx.ingress.kubernetes.io/whitelist-source-range</code></td>
+                <td>Evaluate <code>haproxy.router.openshift.io/ip_allowlist</code>; keep large or centrally managed lists at the load balancer or firewall layer.</td>
+              </tr>
+              <tr>
+                <td><code>nginx.ingress.kubernetes.io/proxy-body-size</code></td>
+                <td>Do not assume a route-level equivalent. Validate application upload behavior and place limits in the application, API gateway, or edge proxy if required.</td>
+              </tr>
+              <tr>
+                <td><code>nginx.ingress.kubernetes.io/proxy-read-timeout</code> and related timeout annotations</td>
+                <td>Review OpenShift router timeout behavior and route annotations before translating. Long-lived connections should be tested under the target shard.</td>
+              </tr>
+              <tr>
+                <td>Snippet annotations such as <code>server-snippet</code> or <code>configuration-snippet</code></td>
+                <td>Treat as redesign work. OpenShift routes do not accept arbitrary nginx config snippets.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Example translation</h3>
+          <pre><code># Source: ingress-nginx
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: checkout
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - checkout.example.com
+    secretName: checkout-tls
+  rules:
+  - host: checkout.example.com
+    http:
+      paths:
+      - path: /shop
+        pathType: Prefix
+        backend:
+          service:
+            name: checkout
+            port:
+              number: 8080</code></pre>
+
+          <pre><code># Target: OpenShift Route admitted by the external shard
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: checkout
+  namespace: payments-prod
+  labels:
+    ingress-shard: external
+  annotations:
+    haproxy.router.openshift.io/rewrite-target: /
+spec:
+  host: checkout.example.com
+  path: /shop
+  to:
+    kind: Service
+    name: checkout
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect</code></pre>
+
+          <h3>Phased migration plan</h3>
+          <ol>
+            <li>Export all ingress-nginx <code>Ingress</code> objects, their annotations, referenced TLS secrets, and backing services.</li>
+            <li>Classify each endpoint as simple route, rewrite route, passthrough TLS route, or custom nginx behavior requiring redesign.</li>
+            <li>Create target namespaces and labels for shard admission; do not change production DNS yet.</li>
+            <li>Create candidate <code>Route</code> resources with temporary hostnames when possible.</li>
+            <li>Verify route admission, TLS behavior, path rewrites, source restrictions, and backend headers through the target shard.</li>
+            <li>Lower DNS TTLs, cut over one low-risk hostname, and keep the ingress-nginx object available for rollback until validation passes.</li>
+            <li>Remove or freeze the source ingress-nginx object only after traffic, logs, metrics, and app-owner signoff are complete.</li>
+          </ol>
+        </section>
+
         <section id="implementation">
           <h2>Implementation Skeleton</h2>
           <p>
@@ -928,6 +1123,10 @@ oc get pods -n openshift-ingress -l ingresscontroller.operator.openshift.io/depl
             <strong>Decision 5: Onboarding control</strong>
             Candidate: namespace labels managed through GitOps and restricted RBAC.
           </div>
+          <div class="decision">
+            <strong>Decision 6: ingress-nginx migration target</strong>
+            Candidate: convert standard HTTP/TLS entries to OpenShift Routes, keep Kubernetes Ingress only where compatibility is required, and redesign snippet-heavy nginx behavior.
+          </div>
         </section>
 
         <section id="references">
@@ -935,12 +1134,15 @@ oc get pods -n openshift-ingress -l ingresscontroller.operator.openshift.io/depl
           <ul>
             <li><a href="https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/ingress_and_load_balancing/index">Red Hat OpenShift Container Platform 4.18: Ingress and load balancing</a></li>
             <li><a href="https://docs.openshift.com/container-platform/4.18/networking/configuring_ingress_cluster_traffic/configuring-ingress-cluster-traffic-ingress-controller.html">OpenShift 4.18: Configuring Ingress Controller sharding</a></li>
+            <li><a href="https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/ingress_and_load_balancing/routes">OpenShift 4.18: Routes and route annotations</a></li>
+            <li><a href="https://kubernetes.github.io/ingress-nginx/examples/rewrite/">ingress-nginx: Rewrite annotations</a></li>
           </ul>
           <p>
             Source notes captured on 2026-05-10: OpenShift 4.18 supports Ingress Controller sharding by namespace
             labels, route labels, or both; the default controller admits all routes unless restricted; DNS must route
-            clients to the router that admitted the route; and OpenShift administrative routes should remain together
-            on the appropriate controller.
+            clients to the router that admitted the route; OpenShift administrative routes should remain together
+            on the appropriate controller; and ingress-nginx annotations require explicit translation because they
+            describe controller-specific behavior.
           </p>
         </section>
       </article>
